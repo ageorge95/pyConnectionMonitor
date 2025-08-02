@@ -1,4 +1,5 @@
 import sys
+import os
 import threading
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -15,11 +16,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QSizePolicy
 )
+from PySide6.QtGui import QIcon
 from ag95 import configure_logger
 
 # Configure logging
 configure_logger(log_level='INFO')
 logger = getLogger(__name__)
+
+def get_running_path(relative_path):
+    if '_internal' in os.listdir():
+        return os.path.join('_internal', relative_path)
+    else:
+        return relative_path
 
 class IOHandler:
     def __init__(self, server: str):
@@ -83,7 +91,8 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _setup_ui(self):
-        self.setWindowTitle(f"Connectivity Monitor ({self.address})")
+        self.setWindowTitle(f"Connectivity Monitor v{open(get_running_path('version.txt')).read()} ({self.address})")
+        self.setWindowIcon(QIcon(get_running_path('icon.ico')))
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)

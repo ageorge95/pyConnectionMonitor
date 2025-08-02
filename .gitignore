@@ -1,0 +1,6 @@
+/.__runtime_log.lock
+/.idea
+/__pycache__/*.pyc
+/runtime_log.log
+/venv
+/activate.bat

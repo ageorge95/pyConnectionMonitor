@@ -1,13 +1,13 @@
 import sys
 import os
 import threading
+import socket
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from traceback import format_exc
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-from socket import gethostbyname, create_connection
 from pickle import dump, load
 from os import path
 from time import sleep
@@ -61,17 +61,21 @@ class InternetChecker:
         self.log = getLogger(self.__class__.__name__)
 
     def is_online(self) -> bool:
+        # First check DNS resolution
         try:
-            gethostbyname(self.host)
-        except Exception:
-            self.log.warning(f"DNS failed for {self.host}")
+            addrinfo = socket.getaddrinfo(self.host, self.port,
+                                          family=socket.AF_INET,
+                                          type=socket.SOCK_STREAM)
+        except Exception as e:
+            self.log.warning(f"DNS failed for {self.host}: {str(e)}")
             return False
+
+        # Then check connection
         try:
-            conn = create_connection((self.host, self.port), timeout=self.timeout)
-            conn.close()
-            return True
-        except Exception:
-            self.log.warning(f"Cannot connect to {self.host}:{self.port}")
+            with socket.create_connection((self.host, self.port), timeout=self.timeout) as conn:
+                return True
+        except Exception as e:
+            self.log.warning(f"Connection failed to {self.host}:{self.port}: {str(e)}")
             return False
 
 class MainWindow(QMainWindow):
@@ -211,7 +215,7 @@ class MainWindow(QMainWindow):
                         merged.append({'start': seg['start'],
                                        'end': seg['end'],
                                        'status': seg['status']})
-                        
+
                 max_history = 7 * 86400  # Keep max 7 days of data
                 cutoff = datetime.now() - timedelta(seconds=max_history)
                 self.data = [entry for entry in self.data if entry['end'] > cutoff]

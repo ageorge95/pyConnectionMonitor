@@ -216,9 +216,15 @@ class MainWindow(QMainWindow):
                                        'end': seg['end'],
                                        'status': seg['status']})
 
-                max_history = 7 * 86400  # Keep max 7 days of data
-                cutoff = datetime.now() - timedelta(seconds=max_history)
-                self.data = [entry for entry in self.data if entry['end'] > cutoff]
+            # Data pruning logic
+            max_history = 7 * 86400  # Base retention
+            buffer_window = 300  # Keep extra 5 minutes for merging context
+            cutoff = datetime.now() - timedelta(seconds=max_history + buffer_window)
+
+            # Only prune entries that are fully outside buffer window
+            self.data = [entry for entry in merged
+                         if entry['end'] > cutoff or
+                         (entry['end'] - entry['start']) > timedelta(seconds=300)]
 
             self.io.save(self.data)
         self.current_online = online

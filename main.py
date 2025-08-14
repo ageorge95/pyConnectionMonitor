@@ -4,6 +4,7 @@ import threading
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+from traceback import format_exc
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from socket import gethostbyname, create_connection
@@ -227,4 +228,9 @@ if __name__ == '__main__':
     window = MainWindow(address)
     window.resize(1200, 600)
     window.show()
-    sys.exit(app.exec())
+    try:
+        app.exec()
+    except:
+        logger.error(f'An error occurred while running the app\n'
+                     f'{format_exc(chain=False)}')
+        sys.exit(1)

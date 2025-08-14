@@ -96,6 +96,8 @@ class MainWindow(QMainWindow):
 
         self.update_plot_signal.connect(self._safe_refresh)
 
+        self.data_lock = threading.Lock()
+
     def _setup_ui(self):
         self.setWindowTitle(f"Connectivity Monitor v{open(get_running_path('version.txt')).read()} ({self.address})")
         self.setWindowIcon(QIcon(get_running_path('icon.ico')))
@@ -180,37 +182,38 @@ class MainWindow(QMainWindow):
                     break
 
     def _refresh(self):
-        online = self.checker.is_online()
-        now = datetime.now()
-        self.data.append({'start': now, 'end': now, 'status': int(online)})
+        with self.data_lock:
+            online = self.checker.is_online()
+            now = datetime.now()
+            self.data.append({'start': now, 'end': now, 'status': int(online)})
 
-        # convert human-readable history string -> seconds
-        history_text = self.history_combo.currentText()
-        value, unit = history_text.split()
-        value = int(value)
-        unit_seconds = {'m': 60, 'h': 3600, 'd': 86400}
-        seconds = value * unit_seconds[unit]
-        oldest = now - timedelta(seconds=seconds)
+            # convert human-readable history string -> seconds
+            history_text = self.history_combo.currentText()
+            value, unit = history_text.split()
+            value = int(value)
+            unit_seconds = {'m': 60, 'h': 3600, 'd': 86400}
+            seconds = value * unit_seconds[unit]
+            oldest = now - timedelta(seconds=seconds)
 
-        # decimate data to show color spans instead of lines
-        MAX_GAP = timedelta(seconds=35)
+            # decimate data to show color spans instead of lines
+            MAX_GAP = timedelta(seconds=35)
 
-        if self.data:
-            merged = [self.data[0]]
-            for seg in self.data[1:]:
-                last = merged[-1]
-                gap = seg['start'] - last['end']
-                if seg['status'] == last['status'] and gap <= MAX_GAP:
-                    # contiguous & same colour → extend
-                    last['end'] = seg['end']
-                else:
-                    # gap too large or colour change → new segment
-                    merged.append({'start': seg['start'],
-                                   'end': seg['end'],
-                                   'status': seg['status']})
-            self.data = merged
+            if self.data:
+                merged = [self.data[0]]
+                for seg in self.data[1:]:
+                    last = merged[-1]
+                    gap = seg['start'] - last['end']
+                    if seg['status'] == last['status'] and gap <= MAX_GAP:
+                        # contiguous & same colour → extend
+                        last['end'] = seg['end']
+                    else:
+                        # gap too large or colour change → new segment
+                        merged.append({'start': seg['start'],
+                                       'end': seg['end'],
+                                       'status': seg['status']})
+                self.data = merged
 
-        self.io.save(self.data)
+            self.io.save(self.data)
         self.current_online = online
         self.update_plot_signal.emit()
 
@@ -233,14 +236,15 @@ class MainWindow(QMainWindow):
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
         self.ax.tick_params(axis='x', rotation=45)
 
-        for entry in self.data:
-            start = entry['start']
-            end = entry['end']
-            status = entry['status']
-            if end < oldest:
-                continue
-            self.ax.axvspan(max(start, oldest), end,
-                            color='green' if status else 'red', alpha=0.3)
+        with self.data_lock:
+            for entry in self.data:
+                start = entry['start']
+                end = entry['end']
+                status = entry['status']
+                if end < oldest:
+                    continue
+                self.ax.axvspan(max(start, oldest), end,
+                                color='green' if status else 'red', alpha=0.3)
 
         self.ax.set_xlim(oldest, now)
         self.canvas.draw()

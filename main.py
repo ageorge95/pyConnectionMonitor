@@ -211,7 +211,10 @@ class MainWindow(QMainWindow):
                         merged.append({'start': seg['start'],
                                        'end': seg['end'],
                                        'status': seg['status']})
-                self.data = merged
+                        
+                max_history = 7 * 86400  # Keep max 7 days of data
+                cutoff = datetime.now() - timedelta(seconds=max_history)
+                self.data = [entry for entry in self.data if entry['end'] > cutoff]
 
             self.io.save(self.data)
         self.current_online = online

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox, QSizePolicy
 )
 from PySide6.QtGui import QIcon
+from PySide6.QtCore import Signal, Slot
 from ag95 import configure_logger
 
 # Configure logging
@@ -74,6 +75,8 @@ class InternetChecker:
             return False
 
 class MainWindow(QMainWindow):
+    update_plot_signal = Signal()
+
     def __init__(self, address: str):
         super().__init__()
         self.address = address
@@ -90,6 +93,8 @@ class MainWindow(QMainWindow):
         self._stop_event = threading.Event()
         self.worker = threading.Thread(target=self._run_loop, daemon=True)
         self.worker.start()
+
+        self.update_plot_signal.connect(self._safe_refresh)
 
     def _setup_ui(self):
         self.setWindowTitle(f"Connectivity Monitor v{open(get_running_path('version.txt')).read()} ({self.address})")
@@ -205,22 +210,44 @@ class MainWindow(QMainWindow):
                                    'status': seg['status']})
             self.data = merged
 
-        # Redraw
+        self.io.save(self.data)
+        self.current_online = online
+        self.update_plot_signal.emit()
+
+    @Slot()
+    def _safe_refresh(self):
+        """all GUI operations now handled in main thread"""
+        # Get current time for time window calculation
+        now = datetime.now()
+
+        # Recalculate history window
+        history_text = self.history_combo.currentText()
+        value, unit = history_text.split()
+        value = int(value)
+        unit_seconds = {'m': 60, 'h': 3600, 'd': 86400}
+        seconds = value * unit_seconds[unit]
+        oldest = now - timedelta(seconds=seconds)
+
+        # Update plot
         self.ax.clear()
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
         self.ax.tick_params(axis='x', rotation=45)
+
         for entry in self.data:
-            start, end, status = entry['start'], entry['end'], entry['status']
+            start = entry['start']
+            end = entry['end']
+            status = entry['status']
             if end < oldest:
                 continue
             self.ax.axvspan(max(start, oldest), end,
                             color='green' if status else 'red', alpha=0.3)
+
         self.ax.set_xlim(oldest, now)
         self.canvas.draw()
 
-        self.io.save(self.data)
-        self.status_label.setText(f"Status: {'ONLINE' if online else 'OFFLINE'}")
-        self._set_running()  # ensure green after each probe
+        # Update status label
+        self.status_label.setText(f"Status: {'ONLINE' if self.current_online else 'OFFLINE'}")
+        self._set_running()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

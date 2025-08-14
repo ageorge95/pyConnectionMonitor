@@ -1,4 +1,4 @@
-# pyFileIntegrityChecker
+# pyConnectionMonitor
 Simple python application that checks network connectivity to another computer:port.
 
 ## Highlights:

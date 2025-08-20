@@ -5,3 +5,4 @@
 /venv
 /activate.bat
 /*.pkl
+/settings.json

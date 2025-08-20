@@ -2,6 +2,7 @@ import sys
 import os
 import threading
 import socket
+import json
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
@@ -9,7 +10,6 @@ from traceback import format_exc
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from pickle import dump, load
-from os import path
 from time import sleep
 from logging import getLogger
 from PySide6.QtWidgets import (
@@ -25,13 +25,15 @@ from ag95 import configure_logger
 configure_logger(log_level='INFO')
 logger = getLogger(__name__)
 
+SETTINGS_FILE = "settings.json"
+
 def get_running_path(relative_path):
     if '_internal' in os.listdir():
         return os.path.join('_internal', relative_path)
     else:
         return relative_path
 
-class IOHandler:
+class IOHandlerCheckData:
     def __init__(self, server: str):
         self.server = server.replace(':', '_')
         self.log = getLogger(self.__class__.__name__)
@@ -45,13 +47,36 @@ class IOHandler:
             self.log.error(f"Failed saving: {e}")
 
     def load(self):
-        if path.exists(f"{self.server}.pkl"):
+        if os.path.exists(f"{self.server}.pkl"):
             try:
                 with open(f"{self.server}.pkl", 'rb') as f:
                     return load(f)
             except Exception as e:
                 self.log.error(f"Failed loading: {e}")
         return []
+
+class IOHandlerSettingsData:
+
+    @staticmethod
+    def save_settings(settings_data):
+        """Saves the provided dictionary to the settings JSON file."""
+        try:
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(settings_data, f, indent=4)
+            logger.info(f"Saved settings to {SETTINGS_FILE}")
+        except Exception as e:
+            logger.error(f"Failed saving settings: {e}")
+
+    @staticmethod
+    def load_settings():
+        """Loads settings from the JSON file, returning defaults if not found."""
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Failed loading settings: {e}")
+        return {}  # Return empty dict if no file or error
 
 class InternetChecker:
     def __init__(self, host: str, port: int, timeout: float = 1.0):
@@ -87,20 +112,79 @@ class MainWindow(QMainWindow):
         self.host, port = address.split(':')
         self.port = int(port)
 
-        self.io = IOHandler(address)
-        self.data = self.io.load()
+        self.io_check_data = IOHandlerCheckData(address)
+        self.io_settings_data = IOHandlerSettingsData
+
+        self.check_data = self.io_check_data.load()
+        self.settings_data = self.io_settings_data.load_settings()
+
+        self.check_data_lock = threading.Lock()
+        self.settings_data_lock = threading.Lock()
 
         self.checker = InternetChecker(self.host, self.port)
         self._setup_ui()
+        self._apply_app_settings()
         self._plot_initial()
 
-        self._stop_event = threading.Event()
-        self.worker = threading.Thread(target=self._run_loop, daemon=True)
-        self.worker.start()
+        self._stop_event = threading.Event() # event for the stop/ resume functionality
+        self._exit_event = threading.Event()  # event for graceful exit
+
+        self.check_worker = threading.Thread(target=self._run_check_loop, daemon=True)
+        self.check_worker.start()
+
+        self.settings_worker = threading.Thread(target=self._save_settings_loop, daemon=True)
+        self.settings_worker.start()
 
         self.update_plot_signal.connect(self._safe_refresh)
 
-        self.data_lock = threading.Lock()
+    def _apply_app_settings(self):
+        """Applies loaded settings to the UI components. Must be called after _setup_ui."""
+        with self.settings_data_lock:
+            if 'cycle' in self.settings_data:
+                self.cycle_combo.setCurrentText(self.settings_data.get('cycle', '5'))
+            if 'history' in self.settings_data:
+                self.history_combo.setCurrentText(self.settings_data.get('history', '1 h'))
+
+    def _save_current_settings(self):
+        """Gathers current settings from UI and saves them."""
+        current_settings = {
+            'cycle': self.cycle_combo.currentText(),
+            'history': self.history_combo.currentText()
+        }
+        self.io_settings_data.save_settings(current_settings)
+
+    def _save_settings_loop(self):
+        """Periodically saves settings in a background thread."""
+        SETTINGS_SAVE_CYCLE_TIME_s = 120
+
+        # sleep for a bit at the beginning to allow the ui to fully start
+        sleep(2)
+
+        while True:
+            if self._exit_event.is_set():
+                break
+
+            if not self._stop_event.is_set():
+                self._save_current_settings()
+            for _ in range(SETTINGS_SAVE_CYCLE_TIME_s):
+                sleep(1)
+                if self._stop_event.is_set():
+                    break
+
+    def closeEvent(self, event):
+        """Handles the window close event to ensure graceful shutdown."""
+        logger.info("Closing application...")
+        self._stop_event.set() # Signal all threads to stop
+        self._exit_event.set() # Signal all threads to exit
+
+        # Wait for threads to finish
+        self.check_worker.join(timeout=2)
+        self.settings_worker.join(timeout=2)
+
+        self._save_current_settings()  # Perform a final save on exit
+        self.io_check_data.save(self.data)  # Also save check_data
+
+        event.accept()
 
     def _setup_ui(self):
         self.setWindowTitle(f"Connectivity Monitor v{open(get_running_path('version.txt')).read()} ({self.address})")
@@ -154,12 +238,13 @@ class MainWindow(QMainWindow):
         self.pause_indicator.setStyleSheet("color: gold; font-size: 24px;")
 
     def _plot_initial(self):
-        for entry in self.data:
-            start = entry['start']
-            end = entry['end']
-            status = entry['status']
-            self.ax.axvspan(start, end,
-                            color='green' if status else 'red', alpha=0.3)
+        with self.check_data_lock:
+            for entry in self.check_data:
+                start = entry['start']
+                end = entry['end']
+                status = entry['status']
+                self.ax.axvspan(start, end,
+                                color='green' if status else 'red', alpha=0.3)
         self.fig.tight_layout()
         self.canvas.draw()
 
@@ -171,12 +256,15 @@ class MainWindow(QMainWindow):
             self._stop_event.set()  # -> pause
             self._set_paused()
 
-    def _run_loop(self):
-        # sleep for a bit at the begining to allow the ui to fully start
+    def _run_check_loop(self):
+        # sleep for a bit at the beginning to allow the ui to fully start
         sleep(2)
         self._set_running()  # initial state
 
         while True:
+            if self._exit_event.is_set():
+                break
+
             if not self._stop_event.is_set():
                 self._refresh()
             wait = int(self.cycle_combo.currentText())
@@ -186,10 +274,10 @@ class MainWindow(QMainWindow):
                     break
 
     def _refresh(self):
-        with self.data_lock:
+        with self.check_data_lock:
             online = self.checker.is_online()
             now = datetime.now()
-            self.data.append({'start': now, 'end': now, 'status': int(online)})
+            self.check_data.append({'start': now, 'end': now, 'status': int(online)})
 
             # convert human-readable history string -> seconds
             history_text = self.history_combo.currentText()
@@ -202,9 +290,9 @@ class MainWindow(QMainWindow):
             # decimate data to show color spans instead of lines
             MAX_GAP = timedelta(seconds=35)
 
-            if self.data:
-                merged = [self.data[0]]
-                for seg in self.data[1:]:
+            if self.check_data:
+                merged = [self.check_data[0]]
+                for seg in self.check_data[1:]:
                     last = merged[-1]
                     gap = seg['start'] - last['end']
                     if seg['status'] == last['status'] and gap <= MAX_GAP:
@@ -226,7 +314,7 @@ class MainWindow(QMainWindow):
                          if entry['end'] > cutoff or
                          (entry['end'] - entry['start']) > timedelta(seconds=300)]
 
-            self.io.save(self.data)
+            self.io_check_data.save(self.data)
         self.current_online = online
         self.update_plot_signal.emit()
 
@@ -249,7 +337,7 @@ class MainWindow(QMainWindow):
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
         self.ax.tick_params(axis='x', rotation=45)
 
-        with self.data_lock:
+        with self.check_data_lock:
             for entry in self.data:
                 start = entry['start']
                 end = entry['end']

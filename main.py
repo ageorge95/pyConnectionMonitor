@@ -1,5 +1,6 @@
 import sys
 import os
+import ctypes
 import threading
 import socket
 import json
@@ -27,11 +28,23 @@ logger = getLogger(__name__)
 
 SETTINGS_FILE = "settings.json"
 
+APP_ID = 'AG95.pyConnectionMonitor'
+ICON_FILE = 'icon.ico'
+
 def get_running_path(relative_path):
-    if '_internal' in os.listdir():
-        return os.path.join('_internal', relative_path)
-    else:
-        return relative_path
+    """Return a bundled file's path in both source and PyInstaller builds."""
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+def set_windows_app_id():
+    """Give the app its own Windows taskbar identity."""
+    if sys.platform != 'win32':
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except (AttributeError, OSError):
+        pass
 
 class IOHandlerCheckData:
     def __init__(self, server: str):
@@ -188,7 +201,7 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle(f"Connectivity Monitor v{open(get_running_path('version.txt')).read()} ({self.address})")
-        self.setWindowIcon(QIcon(get_running_path('icon.ico')))
+        self.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -355,7 +368,9 @@ class MainWindow(QMainWindow):
         self._set_running()
 
 if __name__ == '__main__':
+    set_windows_app_id()
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
     address = sys.argv[1] if len(sys.argv) > 1 else '8.8.8.8:53'
     window = MainWindow(address)
     window.resize(1200, 600)

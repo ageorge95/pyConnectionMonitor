@@ -6,3 +6,5 @@
 /activate.bat
 /*.pkl
 /settings.json
+/activate.ps1
+/activate.sh

@@ -3,8 +3,11 @@ Simple python application that checks network connectivity to another computer:p
 
 ## Highlights:
 - the app is able to monitor any computer host and port, or use the default 8.8.8.8:53 to check for internet connectivity
-- the monitored server (host:port) is configured directly in the GUI; recently used servers are remembered and each server keeps its own history
-- the monitored server and its status are clearly displayed at the top of the window
+- multiple servers can be monitored at the same time: type a host:port in the GUI and press Add; each server gets its own graph, stacked one below the other on a shared time axis
+- each server can have an optional alias (e.g. "Google DNS"), entered when adding it or changed later with the ✎ button; aliases are remembered
+- each server's alias, host:port and ONLINE/OFFLINE status are shown next to its graph; the ✕ button stops monitoring it
+- all servers are checked in parallel, so a slow or offline server does not delay the others
+- the monitored servers are restored when the app is started again; recently used servers are remembered and each server keeps its own history
 - the app shows a graph to easily see the connection status over time
 - you can select the cycle time, default 1 second
 - you can select the plot history size, default 1 minute

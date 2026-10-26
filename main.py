@@ -16,7 +16,8 @@ from logging import getLogger
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QComboBox, QSizePolicy, QMessageBox
+    QPushButton, QComboBox, QSizePolicy, QMessageBox,
+    QLineEdit, QInputDialog
 )
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import Signal, Slot
@@ -136,6 +137,102 @@ class InternetChecker:
             self.log.warning(f"Connection failed to {self.host}:{self.port}: {str(e)}")
             return False
 
+def merge_segments(check_data):
+    """Merge consecutive checks with the same status into color spans and prune old entries."""
+    # decimate data to show color spans instead of lines
+    MAX_GAP = timedelta(seconds=35)
+
+    merged = []
+    for seg in check_data:
+        if merged:
+            last = merged[-1]
+            gap = seg['start'] - last['end']
+            if seg['status'] == last['status'] and gap <= MAX_GAP:
+                # contiguous & same colour → extend
+                last['end'] = seg['end']
+                continue
+        # first entry, gap too large or colour change → new segment
+        merged.append({'start': seg['start'],
+                       'end': seg['end'],
+                       'status': seg['status']})
+
+    # Data pruning logic
+    max_history = 7 * 86400  # Base retention
+    buffer_window = 300  # Keep extra 5 minutes for merging context
+    cutoff = datetime.now() - timedelta(seconds=max_history + buffer_window)
+
+    # Only prune entries that are fully outside buffer window
+    return [entry for entry in merged
+            if entry['end'] > cutoff or
+            (entry['end'] - entry['start']) > timedelta(seconds=300)]
+
+class MonitoredServer:
+    """One monitored host:port together with its check history."""
+
+    def __init__(self, address: str):
+        host, port = parse_server(address)
+        self.address = f"{host}:{port}"
+        self.checker = InternetChecker(host, port)
+        self.io_check_data = IOHandlerCheckData(self.address)
+        self.data = list(self.io_check_data.load())
+        self.online = None  # None = not checked yet
+
+    def save(self):
+        self.io_check_data.save(self.data)
+
+class ServerRow(QWidget):
+    """Label shown to the left of a server's plot: alias, address, status and edit/remove buttons."""
+
+    def __init__(self, address: str, alias: str, on_remove, on_rename, parent=None):
+        super().__init__(parent)
+        self.address = address
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+
+        text = QVBoxLayout()
+        text.addStretch()
+        self.name_label = QLabel()
+        self.name_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.name_label.setWordWrap(True)  # long aliases wrap instead of widening the column
+        text.addWidget(self.name_label)
+        self.address_label = QLabel(address)
+        self.address_label.setStyleSheet("color: gray;")
+        text.addWidget(self.address_label)
+        self.status_label = QLabel()
+        text.addWidget(self.status_label)
+        text.addStretch()
+        layout.addLayout(text, 1)
+
+        rename_btn = QPushButton("✎")
+        rename_btn.setFixedWidth(28)
+        rename_btn.setToolTip(f"Change the alias of {address}")
+        rename_btn.clicked.connect(lambda: on_rename(address))
+        layout.addWidget(rename_btn)
+
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedWidth(28)
+        remove_btn.setToolTip(f"Stop monitoring {address}")
+        remove_btn.clicked.connect(lambda: on_remove(address))
+        layout.addWidget(remove_btn)
+
+        self.set_alias(alias)
+        self.set_status(None)
+
+    def set_alias(self, alias: str):
+        """Shows the alias in bold with the address below it; without an alias only the address is shown."""
+        self.name_label.setText(alias or self.address)
+        self.address_label.setVisible(bool(alias))
+        self.setToolTip(f"{alias} ({self.address})" if alias else self.address)
+
+    def set_status(self, online):
+        if online is None:
+            self.status_label.setText("CHECKING...")
+            self.status_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        else:
+            self.status_label.setText('ONLINE' if online else 'OFFLINE')
+            self.status_label.setStyleSheet(
+                f"font-size: 14px; font-weight: bold; color: {'green' if online else 'red'};")
+
 class MainWindow(QMainWindow):
     update_plot_signal = Signal()
 
@@ -149,22 +246,33 @@ class MainWindow(QMainWindow):
 
         self._stop_event = threading.Event() # event for the stop/ resume functionality
         self._exit_event = threading.Event()  # event for graceful exit
-        self._server_changed_event = threading.Event()  # wakes the check loop after a server switch
+        self._server_changed_event = threading.Event()  # wakes the check loop after a server was added
 
-        # restore the last monitored server (fallback to the default one)
-        address = self.settings_data.get('server', DEFAULT_SERVER)
-        try:
-            parse_server(address)
-        except ValueError:
-            logger.warning(f"Invalid saved server '{address}', using {DEFAULT_SERVER}")
-            address = DEFAULT_SERVER
+        self.servers = {}  # address -> MonitoredServer, in display order
+        self.server_rows = {}  # address -> ServerRow
+        self.axes = {}  # address -> matplotlib axes
         self.recent_servers = [s for s in self.settings_data.get('recent_servers', []) if isinstance(s, str)]
-        self.current_online = None
+        # address -> alias; kept for recent servers too, so re-adding a server restores its alias
+        saved_aliases = self.settings_data.get('aliases', {})
+        self.aliases = {a: n for a, n in saved_aliases.items()
+                        if isinstance(a, str) and isinstance(n, str) and n.strip()} \
+            if isinstance(saved_aliases, dict) else {}
+
+        # restore the servers monitored before closing; migrate the old single 'server' setting
+        if 'servers' in self.settings_data:
+            addresses = [s for s in self.settings_data['servers'] if isinstance(s, str)]
+        else:
+            addresses = [self.settings_data.get('server', DEFAULT_SERVER)]
 
         self._setup_ui()
         self._apply_app_settings()
-        self._load_server(address)
-        self._plot_initial()
+        for address in addresses:
+            try:
+                self._add_server(address)
+            except ValueError:
+                logger.warning(f"Ignoring invalid saved server '{address}'")
+        self._update_recent_combo()
+        self._safe_refresh()
 
         self.check_worker = threading.Thread(target=self._run_check_loop, daemon=True)
         self.check_worker.start()
@@ -182,62 +290,148 @@ class MainWindow(QMainWindow):
             if 'history' in self.settings_data:
                 self.history_combo.setCurrentText(self.settings_data.get('history', '1 h'))
 
-    def _load_server(self, address: str):
-        """Switches the monitored server; each server keeps its own history file."""
-        host, port = parse_server(address)
-        address = f"{host}:{port}"
+    def _add_server(self, address: str, alias: str = None):
+        """Starts monitoring a server; each server keeps its own history file.
+        alias=None keeps the previously saved alias (if any).
+        Raises ValueError for an invalid address. Returns False if already monitored."""
+        server = MonitoredServer(address)
+        if server.address in self.servers:
+            return False
+
+        if alias is not None:
+            self._set_alias(server.address, alias)
 
         with self.check_data_lock:
-            # persist the history of the previously monitored server
-            if getattr(self, 'io_check_data', None) is not None:
-                self.io_check_data.save(self.data)
+            self.servers[server.address] = server
 
-            self.address = address
-            self.host, self.port = host, port
-            self.io_check_data = IOHandlerCheckData(address)
-            self.check_data = self.io_check_data.load()
-            self.data = list(self.check_data)
-            self.checker = InternetChecker(host, port)
-            self.current_online = None
+        row = ServerRow(server.address, self.aliases.get(server.address, ''),
+                        self._remove_server, self._rename_server)
+        self.server_rows[server.address] = row
+        self.labels_layout.addWidget(row, 1)
 
+        self._remember_recent(server.address)
+        self._rebuild_axes()
+        self._update_window_title()
+        logger.info(f"Monitoring {server.address}")
+        return True
+
+    def _remove_server(self, address: str):
+        """Stops monitoring a server; its history file is kept on disk."""
+        with self.check_data_lock:
+            server = self.servers.pop(address, None)
+            if server is not None:
+                server.save()
+        if server is None:
+            return
+
+        row = self.server_rows.pop(address)
+        self.labels_layout.removeWidget(row)
+        row.deleteLater()
+
+        self._rebuild_axes()
+        self._update_window_title()
+        self._safe_refresh()
+        self._save_current_settings()
+        logger.info(f"Stopped monitoring {address}")
+
+    def _set_alias(self, address: str, alias: str):
+        alias = alias.strip()
+        if alias:
+            self.aliases[address] = alias
+        else:
+            self.aliases.pop(address, None)
+
+    def _rename_server(self, address: str):
+        """Handler for the edit button of a server row."""
+        alias, ok = QInputDialog.getText(
+            self, "Server alias",
+            f"Alias for {address} (leave empty to show only host:port):",
+            text=self.aliases.get(address, ''))
+        if not ok:
+            return
+        self._set_alias(address, alias)
+        if address in self.server_rows:
+            self.server_rows[address].set_alias(self.aliases.get(address, ''))
+        self._save_current_settings()
+
+    def _on_recent_selected(self, index: int):
+        """Picking a recent server pre-fills its saved alias."""
+        address = self.server_combo.itemText(index)
+        self.alias_edit.setText(self.aliases.get(address, ''))
+
+    def _remember_recent(self, address: str):
         # keep the most recently used servers at the top of the list
         self.recent_servers = [address] + [s for s in self.recent_servers if s != address]
         self.recent_servers = self.recent_servers[:MAX_RECENT_SERVERS]
+
+    def _update_recent_combo(self, text: str = ''):
         self.server_combo.blockSignals(True)
         self.server_combo.clear()
         self.server_combo.addItems(self.recent_servers)
-        self.server_combo.setCurrentText(address)
+        self.server_combo.setCurrentText(text)
         self.server_combo.blockSignals(False)
 
-        self.server_label.setText(f"Monitoring: {address}")
-        self.status_label.setText("Status: CHECKING...")
-        self.setWindowTitle(f"Connectivity Monitor v{self.version} ({address})")
-        logger.info(f"Monitoring {address}")
+    def _update_window_title(self):
+        count = len(self.servers)
+        suffix = f" ({count} server{'s' if count != 1 else ''})"
+        self.setWindowTitle(f"Connectivity Monitor v{self.version}{suffix}")
+        self.empty_label.setVisible(count == 0)
 
-    def _apply_server(self):
-        """Handler for the Apply button / Enter key in the server box."""
+    def _on_add_server(self):
+        """Handler for the Add button / Enter key in the server box."""
         text = self.server_combo.currentText().strip()
+        alias = self.alias_edit.text().strip()
         try:
-            host, port = parse_server(text)
+            # an empty alias box keeps the alias remembered for this server (if any)
+            added = self._add_server(text, alias or None)
         except ValueError as e:
             QMessageBox.warning(self, "Invalid server", str(e))
-            self.server_combo.setCurrentText(self.address)
             return
-        if f"{host}:{port}" == self.address:
+        if not added:
+            QMessageBox.information(self, "Already monitored",
+                                    f"{text} is already being monitored.")
             return
 
-        self._load_server(text)
+        self._update_recent_combo()
+        self.alias_edit.clear()
         self._safe_refresh()
         self._save_current_settings()
         self._server_changed_event.set()  # check the new server right away
+
+    def _rebuild_axes(self):
+        """Recreates one subplot per server, all sharing the same x axis."""
+        self.fig.clear()
+        self.axes = {}
+        addresses = list(self.servers)
+        if addresses:
+            axes = self.fig.subplots(len(addresses), 1, sharex=True, squeeze=False)[:, 0]
+            for address, ax in zip(addresses, axes):
+                self.axes[address] = ax
+        self._layout_figure()
+
+    def _layout_figure(self):
+        """Fixed margins so each subplot lines up with its label on the left."""
+        height_px = max(self.canvas.height(), 1)
+        width_px = max(self.canvas.width(), 1)
+        bottom_px = 100  # room for the rotated date labels of the shared x axis
+        left_px = 140  # room for the first rotated date label
+        bottom = min(bottom_px / height_px, 0.6)
+        left = min(left_px / width_px, 0.4)
+        self.fig.subplots_adjust(left=left, right=0.99, top=0.98, bottom=bottom, hspace=0.15)
+        # align the label column with the plot area
+        top_margin = int(height_px * 0.02)
+        self.labels_layout.setContentsMargins(0, top_margin, 0, int(height_px * bottom))
 
     def _save_current_settings(self):
         """Gathers current settings from UI and saves them."""
         current_settings = {
             'cycle': self.cycle_combo.currentText(),
             'history': self.history_combo.currentText(),
-            'server': self.address,
-            'recent_servers': list(self.recent_servers)
+            'servers': list(self.servers),
+            'recent_servers': list(self.recent_servers),
+            # only keep aliases of servers that are still monitored or in the recent list
+            'aliases': {a: n for a, n in self.aliases.items()
+                        if a in self.servers or a in self.recent_servers}
         }
         self.io_settings_data.save_settings(current_settings)
 
@@ -270,9 +464,16 @@ class MainWindow(QMainWindow):
         self.settings_worker.join(timeout=2)
 
         self._save_current_settings()  # Perform a final save on exit
-        self.io_check_data.save(self.data)  # Also save check_data
+        with self.check_data_lock:
+            for server in self.servers.values():
+                server.save()  # Also save check_data
 
         event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'canvas'):
+            self._layout_figure()
 
     def _setup_ui(self):
         with open(get_running_path('version.txt')) as f:
@@ -283,32 +484,30 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # header: monitored server + connection status, clearly visible
-        header = QHBoxLayout()
-        self.server_label = QLabel("Monitoring: -")
-        self.server_label.setStyleSheet("font-size: 18px; font-weight: bold;")
-        header.addWidget(self.server_label)
-        header.addSpacing(30)
-        self.status_label = QLabel("Status: INITIALIZED")
-        self.status_label.setStyleSheet("font-size: 18px; font-weight: bold;")
-        header.addWidget(self.status_label)
-        header.addStretch()
-        layout.addLayout(header)
-
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Server (host:port):"))
         self.server_combo = QComboBox()
         self.server_combo.setEditable(True)
         self.server_combo.setInsertPolicy(QComboBox.NoInsert)
         self.server_combo.setMinimumWidth(220)
-        self.server_combo.setToolTip("Type a host:port (e.g. 8.8.8.8:53) or pick a recently used server")
-        self.server_combo.lineEdit().returnPressed.connect(self._apply_server)
-        self.server_combo.activated.connect(lambda _index: self._apply_server())
+        self.server_combo.setToolTip("Type a host:port (e.g. 8.8.8.8:53) or pick a recently used server, then press Add")
+        self.server_combo.lineEdit().setPlaceholderText(DEFAULT_SERVER)
+        self.server_combo.lineEdit().returnPressed.connect(self._on_add_server)
+        self.server_combo.activated.connect(self._on_recent_selected)
         controls.addWidget(self.server_combo)
 
-        self.apply_server_btn = QPushButton("Apply")
-        self.apply_server_btn.clicked.connect(self._apply_server)
-        controls.addWidget(self.apply_server_btn)
+        controls.addWidget(QLabel("Alias:"))
+        self.alias_edit = QLineEdit()
+        self.alias_edit.setPlaceholderText("optional, e.g. Google DNS")
+        self.alias_edit.setToolTip("Optional friendly name shown next to the server's graph")
+        self.alias_edit.setMinimumWidth(160)
+        self.alias_edit.returnPressed.connect(self._on_add_server)
+        controls.addWidget(self.alias_edit)
+
+        self.add_server_btn = QPushButton("Add")
+        self.add_server_btn.setToolTip("Start monitoring this server in a new graph")
+        self.add_server_btn.clicked.connect(self._on_add_server)
+        controls.addWidget(self.add_server_btn)
         controls.addSpacing(20)
 
         self.stop_btn = QPushButton("Stop/Resume")
@@ -328,19 +527,29 @@ class MainWindow(QMainWindow):
         self.history_combo.addItems(
             ["1 m", "5 m", "15 m", "30 m", "1 h", "3 h", "6 h", "12 h", "1 d", "3 d", "7 d"]
         )
+        self.history_combo.currentTextChanged.connect(lambda _text: self._safe_refresh())
         controls.addWidget(QLabel("History:"))
         controls.addWidget(self.history_combo)
+        controls.addStretch()
 
         layout.addLayout(controls)
 
-        self.fig, self.ax = plt.subplots()
-        self.fig.subplots_adjust(bottom=0.25)  # leave room for rotated labels
-        self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
-        self.ax.tick_params(axis='x', rotation=45)
+        # plot area: a column of server labels on the left, the stacked plots on the right
+        plots = QHBoxLayout()
+        labels_widget = QWidget()
+        labels_widget.setFixedWidth(230)
+        self.labels_layout = QVBoxLayout(labels_widget)
+        self.labels_layout.setSpacing(0)
+        self.empty_label = QLabel("No servers monitored.\nType a host:port above and press Add.")
+        self.empty_label.setWordWrap(True)
+        self.labels_layout.addWidget(self.empty_label)
+        plots.addWidget(labels_widget)
 
+        self.fig = plt.figure()
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.canvas)
+        plots.addWidget(self.canvas, 1)
+        layout.addLayout(plots, 1)
 
         self.toolbar = NavigationToolbar(self.canvas, self)
         layout.addWidget(self.toolbar)
@@ -350,17 +559,6 @@ class MainWindow(QMainWindow):
 
     def _set_paused(self):
         self.pause_indicator.setStyleSheet("color: gold; font-size: 24px;")
-
-    def _plot_initial(self):
-        with self.check_data_lock:
-            for entry in self.check_data:
-                start = entry['start']
-                end = entry['end']
-                status = entry['status']
-                self.ax.axvspan(start, end,
-                                color='green' if status else 'red', alpha=0.3)
-        self.fig.tight_layout()
-        self.canvas.draw()
 
     def _toggle(self):
         if self._stop_event.is_set():
@@ -373,7 +571,6 @@ class MainWindow(QMainWindow):
     def _run_check_loop(self):
         # sleep for a bit at the beginning to allow the ui to fully start
         sleep(2)
-        self._set_running()  # initial state
 
         while True:
             if self._exit_event.is_set():
@@ -389,105 +586,88 @@ class MainWindow(QMainWindow):
                     break
 
     def _refresh(self):
-        # run the (potentially slow) network check outside the lock so the GUI never blocks
-        checker, address = self.checker, self.address
-        online = checker.is_online()
-
+        """Checks all servers in parallel, so a slow/offline server doesn't delay the others."""
         with self.check_data_lock:
-            if address != self.address:
-                return  # the server was changed during the check, drop the stale result
-            now = datetime.now()
-            self.check_data.append({'start': now, 'end': now, 'status': int(online)})
+            servers = list(self.servers.values())
+        if not servers:
+            return
 
-            # convert human-readable history string -> seconds
-            history_text = self.history_combo.currentText()
-            value, unit = history_text.split()
-            value = int(value)
-            unit_seconds = {'m': 60, 'h': 3600, 'd': 86400}
-            seconds = value * unit_seconds[unit]
-            oldest = now - timedelta(seconds=seconds)
+        results = {}
 
-            # decimate data to show color spans instead of lines
-            MAX_GAP = timedelta(seconds=35)
+        def check(server):
+            # the (potentially slow) network check runs outside the lock so the GUI never blocks
+            results[server.address] = server.checker.is_online()
 
-            if self.check_data:
-                merged = [self.check_data[0]]
-                for seg in self.check_data[1:]:
-                    last = merged[-1]
-                    gap = seg['start'] - last['end']
-                    if seg['status'] == last['status'] and gap <= MAX_GAP:
-                        # contiguous & same colour → extend
-                        last['end'] = seg['end']
-                    else:
-                        # gap too large or colour change → new segment
-                        merged.append({'start': seg['start'],
-                                       'end': seg['end'],
-                                       'status': seg['status']})
+        threads = [threading.Thread(target=check, args=(server,), daemon=True) for server in servers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-            # Data pruning logic
-            max_history = 7 * 86400  # Base retention
-            buffer_window = 300  # Keep extra 5 minutes for merging context
-            cutoff = datetime.now() - timedelta(seconds=max_history + buffer_window)
-
-            # Only prune entries that are fully outside buffer window
-            self.data = [entry for entry in merged
-                         if entry['end'] > cutoff or
-                         (entry['end'] - entry['start']) > timedelta(seconds=300)]
-
-            self.check_data = self.data
-            self.io_check_data.save(self.data)
-            self.current_online = online
+        now = datetime.now()
+        with self.check_data_lock:
+            for server in servers:
+                if self.servers.get(server.address) is not server:
+                    continue  # the server was removed during the check, drop the stale result
+                online = results.get(server.address, False)
+                server.data.append({'start': now, 'end': now, 'status': int(online)})
+                server.data = merge_segments(server.data)
+                server.save()
+                server.online = online
         self.update_plot_signal.emit()
+
+    def _history_seconds(self):
+        # convert human-readable history string -> seconds
+        value, unit = self.history_combo.currentText().split()
+        unit_seconds = {'m': 60, 'h': 3600, 'd': 86400}
+        return int(value) * unit_seconds[unit]
 
     @Slot()
     def _safe_refresh(self):
         """all GUI operations now handled in main thread"""
         # Get current time for time window calculation
         now = datetime.now()
-
-        # Recalculate history window
-        history_text = self.history_combo.currentText()
-        value, unit = history_text.split()
-        value = int(value)
-        unit_seconds = {'m': 60, 'h': 3600, 'd': 86400}
-        seconds = value * unit_seconds[unit]
-        oldest = now - timedelta(seconds=seconds)
-
-        # Update plot
-        self.ax.clear()
-        self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
-        self.ax.tick_params(axis='x', rotation=45)
+        oldest = now - timedelta(seconds=self._history_seconds())
 
         with self.check_data_lock:
-            for entry in self.data:
-                start = entry['start']
-                end = entry['end']
-                status = entry['status']
-                if end < oldest:
+            snapshot = [(server.address, list(server.data), server.online)
+                        for server in self.servers.values()]
+
+        last_ax = None
+        for address, data, online in snapshot:
+            ax = self.axes.get(address)
+            if ax is None:
+                continue
+            last_ax = ax
+            ax.clear()
+            ax.set_yticks([])
+            for entry in data:
+                if entry['end'] < oldest:
                     continue
-                self.ax.axvspan(max(start, oldest), end,
-                                color='green' if status else 'red', alpha=0.3)
+                ax.axvspan(max(entry['start'], oldest), entry['end'],
+                           color='green' if entry['status'] else 'red', alpha=0.3)
+            ax.tick_params(axis='x', labelbottom=False)
+            self.server_rows[address].set_status(online)
 
-        self.ax.set_xlim(oldest, now)
-        self.canvas.draw()
+        if last_ax is not None:
+            # shared x axis: only the bottom plot shows the date labels
+            last_ax.set_xlim(oldest, now)
+            last_ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M:%S'))
+            last_ax.tick_params(axis='x', labelbottom=True)
+            # anchor the rotated labels at their tick so they are not clipped
+            plt.setp(last_ax.get_xticklabels(), rotation=30, ha='right')
+        self.canvas.draw_idle()
 
-        # Update status label
-        if self.current_online is None:
-            self.status_label.setText("Status: CHECKING...")
-            self.status_label.setStyleSheet("font-size: 18px; font-weight: bold;")
-        else:
-            self.status_label.setText(f"Status: {'ONLINE' if self.current_online else 'OFFLINE'}")
-            self.status_label.setStyleSheet(
-                f"font-size: 18px; font-weight: bold; color: {'green' if self.current_online else 'red'};")
         if not self._stop_event.is_set():
             self._set_running()
+
 
 if __name__ == '__main__':
     set_windows_app_id()
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
     window = MainWindow()
-    window.resize(1200, 600)
+    window.resize(1200, 700)
     window.show()
     try:
         app.exec()

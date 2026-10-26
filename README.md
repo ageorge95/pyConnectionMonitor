@@ -2,7 +2,9 @@
 Simple python application that checks network connectivity to another computer:port.
 
 ## Highlights:
-- the app is able to provide any computer host and port, or use the default 8.8.8.8:53 to check for internet connectivity
+- the app is able to monitor any computer host and port, or use the default 8.8.8.8:53 to check for internet connectivity
+- the monitored server (host:port) is configured directly in the GUI; recently used servers are remembered and each server keeps its own history
+- the monitored server and its status are clearly displayed at the top of the window
 - the app shows a graph to easily see the connection status over time
 - you can select the cycle time, default 1 second
 - you can select the plot history size, default 1 minute
